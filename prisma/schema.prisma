@@ -1,0 +1,519 @@
+// FULBO90 — schema de datos.
+// La URL de conexión vive en prisma.config.ts (Prisma 7).
+
+generator client {
+  provider = "prisma-client"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────────── Enums ─────────────────────────────
+
+enum Position {
+  ARQ // Arquero
+  LD // Lateral derecho
+  DFC // Defensor central
+  LI // Lateral izquierdo
+  MCD // Mediocampista defensivo
+  MC // Mediocampista central
+  MCO // Enganche / mediapunta
+  MD // Volante derecho
+  MI // Volante izquierdo
+  ED // Extremo derecho
+  EI // Extremo izquierdo
+  DC // Delantero centro
+}
+
+enum CompetitionType {
+  CLUB_INTERNATIONAL // Libertadores, Sudamericana, Intercontinental
+  CLUB_LEAGUE // Liga Profesional, Brasileirão
+  CLUB_CUP // Copa Argentina
+  NATIONAL_TEAM // Mundial, Copa América
+}
+
+enum AchievementResult {
+  WINNER
+  RUNNER_UP
+  TOP_SCORER
+  BEST_PLAYER
+}
+
+enum ChallengeMode {
+  DAILY
+  INFINITE
+  CURATED
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum ChallengeStatus {
+  DRAFT
+  SCHEDULED // asignado a una fecha futura
+  PUBLISHED // su fecha ya llegó: inmutable
+  RESERVE // validado y guardado para usar si falla la generación
+  ARCHIVED
+}
+
+enum DailySource {
+  GENERATED
+  RESERVE
+  MANUAL
+}
+
+enum LogLevel {
+  INFO
+  WARN
+  ERROR
+}
+
+// ─────────────────────────── Fútbol ────────────────────────────
+
+model Player {
+  id                 String     @id // slug estable: "julian-alvarez"
+  fullName           String
+  shortName          String?
+  normalizedName     String // minúsculas sin tildes, para búsqueda
+  nationality        String // ISO-3166 alpha-2: "AR", "UY"...
+  secondNationality  String?
+  birthDate          DateTime?  @db.Date
+  active             Boolean    @default(true)
+  primaryPosition    Position
+  secondaryPositions Position[]
+  imageUrl           String?
+  createdAt          DateTime   @default(now())
+  updatedAt          DateTime   @updatedAt
+
+  clubs         PlayerClub[]
+  achievements  PlayerCompetitionAchievement[]
+  nationalTeams PlayerNationalTeam[]
+  lineups       MatchLineup[]
+  coachProfile  Coach?
+  answers       ChallengeAnswer[]
+
+  @@index([normalizedName])
+  /// Búsqueda difusa por nombre (pg_trgm): ver migración auth_sessions_indexes.
+  @@index([normalizedName(ops: raw("gin_trgm_ops"))], type: Gin, map: "Player_normalizedName_trgm_idx")
+}
+
+model Club {
+  id             String   @id // "river"
+  name           String
+  shortName      String
+  country        String // ISO alpha-2 (EN = Inglaterra)
+  city           String
+  foundedYear    Int?
+  nickname       String?
+  stadium        String?
+  primaryColor   String? // usados para el escudo genérico (monograma)
+  secondaryColor String?
+  tier           Int      @default(3) // 1 = grande continental, 3 = resto. Afecta generación de pistas.
+  logoUrl        String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  players      PlayerClub[]
+  achievements ClubAchievement[]
+  playerTitles PlayerCompetitionAchievement[]
+  homeMatches  Match[]                        @relation("HomeClub")
+  awayMatches  Match[]                        @relation("AwayClub")
+  coachStints  CoachStint[]
+
+  @@index([country])
+}
+
+/// Paso de un jugador por un club. toYear = null => sigue en el club.
+model PlayerClub {
+  id          String  @id @default(cuid())
+  playerId    String
+  clubId      String
+  fromYear    Int?
+  toYear      Int?
+  isYouth     Boolean @default(false) // sólo inferiores (no cuenta como "jugó en")
+  isAcademy   Boolean @default(false) // surgido de las inferiores del club
+  isLoan      Boolean @default(false)
+  appearances Int?
+  goals       Int?
+
+  player Player @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  club   Club   @relation(fields: [clubId], references: [id], onDelete: Cascade)
+
+  @@index([playerId])
+  @@index([clubId, playerId])
+}
+
+model Competition {
+  id        String          @id // "libertadores"
+  name      String
+  shortName String
+  region    String // "CONMEBOL", "FIFA", "AR", "BR"...
+  country   String?
+  type      CompetitionType
+
+  achievements       Achievement[]
+  clubAchievements   ClubAchievement[]
+  playerAchievements PlayerCompetitionAchievement[]
+  matches            Match[]
+}
+
+/// Catálogo de logros (p. ej. "Campeón de América", "Goleador del Mundial").
+model Achievement {
+  id            String            @id // "libertadores-winner"
+  name          String
+  competitionId String?
+  result        AchievementResult @default(WINNER)
+  description   String?
+
+  competition Competition? @relation(fields: [competitionId], references: [id])
+}
+
+model ClubAchievement {
+  id            String            @id @default(cuid())
+  clubId        String
+  competitionId String
+  season        Int
+  result        AchievementResult @default(WINNER)
+
+  club        Club        @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  competition Competition @relation(fields: [competitionId], references: [id], onDelete: Cascade)
+
+  @@unique([clubId, competitionId, season, result])
+}
+
+/// Título o distinción obtenida por un jugador, con el club o selección con que la obtuvo.
+model PlayerCompetitionAchievement {
+  id             String            @id @default(cuid())
+  playerId       String
+  competitionId  String
+  season         Int
+  result         AchievementResult @default(WINNER)
+  clubId         String?
+  nationalTeamId String?
+
+  player       Player        @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  competition  Competition   @relation(fields: [competitionId], references: [id], onDelete: Cascade)
+  club         Club?         @relation(fields: [clubId], references: [id])
+  nationalTeam NationalTeam? @relation(fields: [nationalTeamId], references: [id])
+
+  @@index([playerId])
+  @@index([competitionId, clubId])
+}
+
+model NationalTeam {
+  id            String @id // "ARG"
+  name          String
+  country       String // ISO alpha-2
+  confederation String // "CONMEBOL"
+
+  players      PlayerNationalTeam[]
+  playerTitles PlayerCompetitionAchievement[]
+  homeMatches  Match[]                        @relation("HomeNationalTeam")
+  awayMatches  Match[]                        @relation("AwayNationalTeam")
+  coachStints  CoachStint[]
+}
+
+model PlayerNationalTeam {
+  id             String @id @default(cuid())
+  playerId       String
+  nationalTeamId String
+  fromYear       Int?
+  toYear         Int?
+  caps           Int?
+  goals          Int?
+
+  player       Player       @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  nationalTeam NationalTeam @relation(fields: [nationalTeamId], references: [id], onDelete: Cascade)
+
+  @@unique([playerId, nationalTeamId])
+}
+
+model Coach {
+  id          String  @id // "marcelo-gallardo-dt"
+  fullName    String
+  nationality String
+  playerId    String? @unique // si también fue futbolista
+
+  player Player?      @relation(fields: [playerId], references: [id])
+  stints CoachStint[]
+}
+
+model CoachStint {
+  id             String  @id @default(cuid())
+  coachId        String
+  clubId         String?
+  nationalTeamId String?
+  fromYear       Int
+  toYear         Int?
+
+  coach        Coach         @relation(fields: [coachId], references: [id], onDelete: Cascade)
+  club         Club?         @relation(fields: [clubId], references: [id])
+  nationalTeam NationalTeam? @relation(fields: [nationalTeamId], references: [id])
+}
+
+model Match {
+  id                 String   @id // "mundial-2022-final"
+  title              String // "Argentina vs Francia — Final Mundial 2022"
+  date               DateTime @db.Date
+  competitionId      String
+  season             Int
+  stage              String
+  venue              String?
+  homeClubId         String?
+  homeNationalTeamId String?
+  awayClubId         String?
+  awayNationalTeamId String?
+  homeScore          Int
+  awayScore          Int
+  homePenalties      Int?
+  awayPenalties      Int?
+  homeFormation      String?
+  awayFormation      String?
+
+  competition      Competition   @relation(fields: [competitionId], references: [id])
+  homeClub         Club?         @relation("HomeClub", fields: [homeClubId], references: [id])
+  awayClub         Club?         @relation("AwayClub", fields: [awayClubId], references: [id])
+  homeNationalTeam NationalTeam? @relation("HomeNationalTeam", fields: [homeNationalTeamId], references: [id])
+  awayNationalTeam NationalTeam? @relation("AwayNationalTeam", fields: [awayNationalTeamId], references: [id])
+  lineups          MatchLineup[]
+}
+
+model MatchLineup {
+  id       String   @id @default(cuid())
+  matchId  String
+  playerId String
+  /// "home" | "away": el equipo concreto se deduce del Match.
+  side     String
+  starter  Boolean  @default(true)
+  position Position
+  goals    Int      @default(0)
+
+  match  Match  @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  player Player @relation(fields: [playerId], references: [id], onDelete: Cascade)
+
+  @@unique([matchId, playerId])
+}
+
+// ─────────────────────────── Juegos ────────────────────────────
+
+model Game {
+  id          String  @id // slug: "grid", "el-11"
+  name        String
+  description String
+  icon        String
+  difficulty  Int     @default(2)
+  enabled     Boolean @default(true)
+  launchDate  DateTime @db.Date
+  sortOrder   Int     @default(0)
+
+  challenges      Challenge[]
+  dailyChallenges DailyChallenge[]
+  results         UserGameResult[]
+}
+
+/// Un desafío concreto. `payload` es la salida de un generador (o armada a mano en /admin):
+/// su forma depende del juego y se valida en lib/game-engine.
+model Challenge {
+  id         String          @id @default(cuid())
+  gameId     String
+  title      String?
+  mode       ChallengeMode   @default(CURATED)
+  status     ChallengeStatus @default(DRAFT)
+  seed       String?
+  /// Momento en que el generador verificó que todas las consignas tienen respuestas correctas.
+  verifiedAt DateTime?
+  /// Huella del contenido (para detectar desafíos repetidos).
+  fingerprint String?
+  difficulty Int             @default(2)
+  payload    Json
+  createdAt  DateTime        @default(now())
+  updatedAt  DateTime        @updatedAt
+
+  game       Game                 @relation(fields: [gameId], references: [id])
+  conditions ChallengeCondition[]
+  answers    ChallengeAnswer[]
+  daily      DailyChallenge[]
+  results    UserGameResult[]
+
+  @@index([gameId, status])
+  @@index([gameId, fingerprint])
+}
+
+/// Condición del motor (JSON con AND/OR/NOT) asociada a una celda, consigna o ronda.
+model ChallengeCondition {
+  id          String @id @default(cuid())
+  challengeId String
+  key         String // "row-0", "col-2", "prompt-4", "round-1"
+  label       String
+  condition   Json
+  sortOrder   Int    @default(0)
+
+  challenge Challenge @relation(fields: [challengeId], references: [id], onDelete: Cascade)
+
+  @@unique([challengeId, key])
+}
+
+/// Respuesta fija para juegos de respuesta única (¿Quién es?, Impostor) o estadísticas de
+/// elección (rareza) para juegos de respuesta abierta (Grid).
+model ChallengeAnswer {
+  id          String  @id @default(cuid())
+  challengeId String
+  key         String // celda / ronda
+  playerId    String?
+  value       String?
+  isCorrect   Boolean @default(true)
+  pickCount   Int     @default(0)
+
+  challenge Challenge @relation(fields: [challengeId], references: [id], onDelete: Cascade)
+  player    Player?   @relation(fields: [playerId], references: [id])
+
+  @@index([challengeId, key])
+}
+
+/// Calendario: un desafío por (fecha, juego). La unicidad hace idempotente al generador.
+model DailyChallenge {
+  id            String      @id @default(cuid())
+  date          DateTime    @db.Date // día en America/Argentina/Buenos_Aires
+  gameId        String
+  challengeId   String
+  number        Int
+  source        DailySource @default(GENERATED)
+  difficulty    Int         @default(2)
+  /// Primera vez que un usuario lo recibió: desde entonces es inmutable.
+  firstServedAt DateTime?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  game      Game      @relation(fields: [gameId], references: [id])
+  challenge Challenge @relation(fields: [challengeId], references: [id])
+
+  @@unique([date, gameId])
+  @@index([date])
+}
+
+/// Elecciones agregadas para calcular la rareza cuando el desafío se generó por seed
+/// (no existe fila en Challenge). challengeKey = "grid:daily-2026-10-23".
+model AnswerStat {
+  id           String @id @default(cuid())
+  challengeKey String
+  cellKey      String
+  playerId     String
+  count        Int    @default(0)
+
+  @@unique([challengeKey, cellKey, playerId])
+  @@index([challengeKey, cellKey])
+}
+
+// ─────────────────────────── Usuarios ──────────────────────────
+// Los invitados juegan con almacenamiento local; los usuarios registrados guardan sus resultados acá.
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  displayName  String
+  passwordHash String
+  role         Role     @default(USER)
+  anonymousId  String?  @unique
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  sessions Session[]
+  results  UserGameResult[]
+}
+
+/// Sesión de login. Se guarda sólo el hash del token; el token viaja en una cookie httpOnly.
+model Session {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model UserGameResult {
+  id           String   @id @default(cuid())
+  userId       String?
+  anonymousId  String?
+  gameId       String
+  challengeId  String?
+  challengeKey String // "grid:daily-2026-10-23" o "grid:inf-abc123"
+  dailyDate    DateTime? @db.Date
+  score        Int
+  maxScore     Int
+  timeMs       Int?
+  rarity       Int?
+  details      Json?
+  createdAt    DateTime @default(now())
+
+  user      User?      @relation(fields: [userId], references: [id])
+  game      Game       @relation(fields: [gameId], references: [id])
+  challenge Challenge? @relation(fields: [challengeId], references: [id])
+
+  /// Un resultado por usuario y desafío: evita registrar dos veces el mismo diario.
+  @@unique([userId, challengeKey])
+  @@index([gameId, dailyDate])
+  @@index([userId, createdAt])
+}
+
+// ───────────────────── Motor de desafíos diarios ─────────────────────
+
+/// Historial de contenido usado (jugador objetivo, cruces de la grilla, rondas…) para evitar repeticiones.
+model ContentUsage {
+  id          String   @id @default(cuid())
+  gameId      String
+  key         String
+  date        DateTime @db.Date
+  challengeId String
+
+  @@unique([gameId, date, key])
+  @@index([gameId, key, date])
+}
+
+/// Contenido bloqueado por un administrador ("player:<id>", "club:<id>", "cond:<hash>"). gameId "*" = todos.
+model BlockedContent {
+  id        String   @id @default(cuid())
+  gameId    String   @default("*")
+  key       String
+  label     String?
+  reason    String?
+  createdAt DateTime @default(now())
+
+  @@unique([gameId, key])
+}
+
+/// Parámetros del generador por juego (editables en /admin/calendario).
+model GameSettings {
+  gameId           String   @id
+  repeatWindowDays Int      @default(30)
+  softRepeatDays   Int      @default(7)
+  minDifficulty    Int      @default(1)
+  maxDifficulty    Int      @default(3)
+  targetDifficulty Int      @default(2)
+  horizonDays      Int      @default(30)
+  reserveSize      Int      @default(5)
+  updatedAt        DateTime @updatedAt
+}
+
+/// Registro de ejecuciones, incidentes y overrides administrativos del motor.
+model GenerationLog {
+  id        String    @id @default(cuid())
+  createdAt DateTime  @default(now())
+  level     LogLevel  @default(INFO)
+  event     String // "generated" | "fallback" | "failed" | "cron-run" | "admin-override"…
+  gameId    String?
+  date      DateTime? @db.Date
+  message   String
+  details   Json?
+
+  @@index([createdAt])
+  @@index([level, createdAt])
+}
